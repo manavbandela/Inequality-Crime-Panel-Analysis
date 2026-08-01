@@ -106,8 +106,3 @@ See `paper/Research_Paper_inequality_crime.pdf` for the full write-up and
 discussion, and `output/tables/regression_table.html` (or `.docx`) for the
 formatted regression table (Table 2: pooled OLS, country FE, two-way FE,
 and two-way FE + interaction, with cluster-robust standard errors).
-
-## License
-
-Add a license of your choice (e.g. MIT) if you want others to be able to
-reuse this code.
