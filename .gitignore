@@ -1,0 +1,19 @@
+# RStudio project files
+.Rproj.user/
+*.Rproj
+
+# R session/history
+.RData
+.Rhistory
+.RDataTmp
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Office temp/lock files
+~$*
+
+# Common OS/editor junk
+Thumbs.db
+.vscode/

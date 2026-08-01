@@ -1,0 +1,841 @@
+---
+title: "Does Income Inequality Drive Crime Rates?"
+subtitle: "A Global Panel Analysis (2006-2023)"
+author:
+  - "Ankita Ankita"
+  - "Manav Bandela"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: cosmo
+    number_sections: true
+    code_folding: show
+  pdf_document:
+    toc: true
+    number_sections: true
+  word_document:
+    toc: true
+---
+
+```{r}
+# 1. SETUP — Install and load required packages
+
+# Core package list
+required_packages <- c(
+  "tidyverse",
+  "readxl",
+  "plm",
+  "lmtest",
+  "sandwich",
+  "modelsummary",
+  "ggplot2",
+  "countrycode",
+  "zoo",
+  "scales",
+  "gt",
+  "kableExtra"
+)
+
+# Install missing packages only
+installed <- rownames(installed.packages())
+missing_packages <- setdiff(required_packages, installed)
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+# Load packages
+invisible(lapply(required_packages, library, character.only = TRUE))
+```
+
+
+```{r}
+# 2. LOAD RAW DATA
+
+# Set the path to your data folder — adjust if needed
+data_path <- "data/"
+
+# ---- 2a. Homicide rate (UNODC) ----
+# Source: UNODC Statistics — Intentional Homicide
+# Sheet: data_cts_intentional_homicide
+# Unit: Rate per 100,000 population, Total sex, Total age, Total dimension
+
+hom_raw <- read_excel(
+  path  = paste0(data_path, "homicide_data.xlsx"),
+  sheet = "data_cts_intentional_homicide",
+  skip  = 2        # first 2 rows are metadata/header info
+)
+
+# ---- 2b. Gini coefficient (World Bank PIP) ----
+# Source: World Bank Poverty & Inequality Platform
+# Format: wide — one column per year labelled "YYYY [YRYYYY]"
+
+gini_raw <- read_csv(
+  file = paste0(data_path, "gini_Data.csv"),
+  show_col_types = FALSE
+)
+
+# ---- 2c. GDP per capita (World Bank WDI) ----
+# Source: World Bank — NY.GDP.PCAP.KD (constant 2015 USD)
+# Format: wide with 4 header rows; skip first 4
+
+gdppc_raw <- read_csv(
+  file      = paste0(data_path, "gdppc_data.csv"),
+  skip      = 4,
+  show_col_types = FALSE
+)
+
+# ---- 2d. Population (World Bank WDI) ----
+# Source: World Bank — SP.POP.TOTL
+# Same wide format as GDP
+
+pop_raw <- read_csv(
+  file      = paste0(data_path, "pop_data.csv"),
+  skip      = 4,
+  show_col_types = FALSE
+)
+
+# ---- 2e. Democracy Index (EIU via World Bank DATA360) ----
+# Source: EIU Democracy Index, scores 0-10
+# Format: long — one row per country-year
+
+di_raw <- read_csv(
+  file = paste0(data_path, "DI.csv"),
+  show_col_types = FALSE
+)
+```
+
+
+```{r}
+# 3. CLEAN AND RESHAPE EACH DATASET
+
+# ---- 3a. Homicide ----
+hom <- hom_raw %>%
+  # Keep only: total rate (not counts), total sex, total age, total dimension
+  filter(
+    `Unit of measurement` == "Rate per 100,000 population",
+    Sex       == "Total",
+    Age       == "Total",
+    Dimension == "Total"
+  ) %>%
+  select(iso3 = Iso3_code, country = Country, year = Year, homicide_rate = VALUE) %>%
+  mutate(
+    year          = as.integer(year),
+    homicide_rate = as.numeric(homicide_rate)
+  ) %>%
+  # Restrict to our study window
+  filter(year >= 2006, year <= 2023)
+
+cat("Homicide: ", nrow(hom), "rows,", n_distinct(hom$iso3), "countries\n")
+
+
+# ---- 3b. Gini ----
+# Wide to long — year columns are named "YYYY [YRYYYY]"
+year_cols_gini <- names(gini_raw)[grepl("YR", names(gini_raw))]
+
+gini <- gini_raw %>%
+  select(`Country Name`, `Country Code`, all_of(year_cols_gini)) %>%
+  rename(country = `Country Name`, iso3 = `Country Code`) %>%
+  pivot_longer(
+    cols      = all_of(year_cols_gini),
+    names_to  = "year_label",
+    values_to = "gini"
+  ) %>%
+  mutate(
+    # Extract 4-digit year from "2005 [YR2005]"
+    year = as.integer(str_extract(year_label, "^[0-9]{4}")),
+    gini = as.numeric(na_if(gini, ".."))   # World Bank uses ".." for missing
+  ) %>%
+  select(iso3, year, gini) %>%
+  filter(year >= 2006, year <= 2023)
+
+cat("Gini (before interpolation):", sum(!is.na(gini$gini)), "non-null values\n")
+
+
+# ---- 3c. GDP per capita ----
+year_cols_wb <- as.character(2006:2023)
+
+gdppc <- gdppc_raw %>%
+  select(`Country Code`, all_of(year_cols_wb)) %>%
+  rename(iso3 = `Country Code`) %>%
+  pivot_longer(
+    cols      = all_of(year_cols_wb),
+    names_to  = "year",
+    values_to = "gdppc"
+  ) %>%
+  mutate(
+    year  = as.integer(year),
+    gdppc = as.numeric(gdppc)
+  )
+
+cat("GDP per capita:", sum(!is.na(gdppc$gdppc)), "non-null values\n")
+
+
+# ---- 3d. Population ----
+pop <- pop_raw %>%
+  select(`Country Code`, all_of(year_cols_wb)) %>%
+  rename(iso3 = `Country Code`) %>%
+  pivot_longer(
+    cols      = all_of(year_cols_wb),
+    names_to  = "year",
+    values_to = "pop"
+  ) %>%
+  mutate(
+    year = as.integer(year),
+    pop  = as.numeric(pop)
+  )
+
+cat("Population:", sum(!is.na(pop$pop)), "non-null values\n")
+
+
+# ---- 3e. Democracy Index ----
+di <- di_raw %>%
+  select(
+    iso3       = REF_AREA,
+    year       = TIME_PERIOD,
+    democracy  = OBS_VALUE
+  ) %>%
+  mutate(
+    year      = as.integer(year),
+    democracy = as.numeric(democracy)
+  ) %>%
+  filter(year >= 2006, year <= 2023)
+
+cat("Democracy Index:", nrow(di), "rows,", n_distinct(di$iso3), "countries\n")
+```
+
+
+```{r}
+# 4. MERGE ALL DATASETS
+
+panel <- hom %>%
+  left_join(gini,  by = c("iso3", "year")) %>%
+  left_join(gdppc, by = c("iso3", "year")) %>%
+  left_join(pop,   by = c("iso3", "year")) %>%
+  left_join(di,    by = c("iso3", "year"))
+
+cat("\nMerged panel:", nrow(panel), "rows,", n_distinct(panel$iso3), "countries\n")
+```
+
+
+```{r}
+# 5. DATA TRANSFORMATIONS
+
+# ---- 5a. Interpolate Gini within-country ----
+# The Gini coefficient is surveyed irregularly (every 2-5 years).
+# Linear interpolation within country is standard practice in the
+# cross-country inequality literature (Fajnzylber et al., 2002).
+# We only interpolate — never extrapolate beyond observed values.
+
+panel <- panel %>%
+  arrange(iso3, year) %>%
+  group_by(iso3) %>%
+  mutate(
+    gini_interp = zoo::na.approx(gini, na.rm = FALSE)  # interpolate only
+  ) %>%
+  ungroup()
+
+cat("Gini after interpolation:", sum(!is.na(panel$gini_interp)), "non-null values\n")
+
+
+# ---- 5b. Log transformations ----
+# Both homicide_rate and gdppc are right-skewed. Log transformation
+# reduces outlier influence and allows % interpretation of coefficients.
+# Consistent with Fajnzylber et al. (2002) and Kelly (2000).
+
+panel <- panel %>%
+  mutate(
+    log_homicide = log(homicide_rate + 0.01),  # +0.01 avoids log(0) for rare zero cases
+    log_gdppc    = log(gdppc)
+  )
+
+
+# ---- 5c. Interaction term for secondary hypothesis ----
+# H2: democracy moderates the inequality-crime relationship.
+# We centre both variables before interacting to reduce multicollinearity.
+
+panel <- panel %>%
+  mutate(
+    gini_c       = gini_interp - mean(gini_interp, na.rm = TRUE),
+    democracy_c  = democracy   - mean(democracy,   na.rm = TRUE),
+    gini_x_dem   = gini_c * democracy_c
+  )
+```
+
+
+```{r}
+# 6. SAMPLE RESTRICTIONS
+
+panel_clean <- panel %>%
+  
+  # (1) Remove microstates (population < 500,000)
+  filter(is.na(pop) | pop >= 500000) %>%
+  
+  # (2) Keep only rows with available interpolated Gini
+  filter(!is.na(gini_interp)) %>%
+  
+  # (3) Drop rows missing GDP or democracy
+  filter(!is.na(log_gdppc), !is.na(democracy)) %>%
+  
+  # (4) Remove countries where the maximum gap between actual
+  #     (non-missing) Gini observations exceeds 5 years
+  group_by(iso3) %>%
+  mutate(
+    # Years where original (non-interpolated) Gini is observed
+    observed_year = ifelse(!is.na(gini), year, NA_real_)
+  ) %>%
+  summarise(
+    max_gap = {
+      yrs <- observed_year[!is.na(observed_year)]
+      if (length(yrs) <= 1) {
+        Inf   # no or only one real observation -> unreliable
+      } else {
+        max(diff(yrs))
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  filter(max_gap <= 5) %>%
+  select(iso3) %>%
+  inner_join(
+    panel %>%
+      filter(is.na(pop) | pop >= 500000) %>%
+      filter(!is.na(gini_interp)) %>%
+      filter(!is.na(log_gdppc), !is.na(democracy)),
+    by = "iso3"
+  ) %>%
+  ungroup()
+
+cat("\n=== FINAL CLEAN SAMPLE ===\n")
+cat("Observations:", nrow(panel_clean), "\n")
+cat("Countries:   ", dplyr::n_distinct(panel_clean$iso3), "\n")
+cat("Year range:  ", min(panel_clean$year), "-", max(panel_clean$year), "\n")
+```
+
+
+```{r}
+# 7. DESCRIPTIVE STATISTICS TABLE
+
+# Select variables for the table
+desc_vars <- panel_clean %>%
+  select(
+    `Homicide rate`       = homicide_rate,
+    `Log homicide rate`   = log_homicide,
+    `Gini coefficient`    = gini_interp,
+    `Log GDP per capita`  = log_gdppc,
+    `Democracy index`     = democracy
+  )
+
+# Publication-quality descriptive stats table
+datasummary_skim(
+  desc_vars,
+  title   = "Table 1: Descriptive Statistics",
+  notes   = "Sources: UNODC (homicide), World Bank PIP (Gini), World Bank WDI (GDP), EIU via World Bank DATA360 (democracy). Sample: 2006–2023.",
+  output  = "descriptive_stats.docx"   # saves to working directory
+)
+
+# Also print to console
+summary(desc_vars)
+```
+
+
+```{r}
+# 8. DATA VISUALISATIONS — PUBLICATION-QUALITY AESTHETICS
+
+# Custom publication theme
+theme_pub <- function() {
+  theme_minimal(base_size = 13, base_family = "Helvetica") +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 16,
+        margin = margin(b = 8)
+      ),
+      plot.subtitle = element_text(
+        size = 11,
+        colour = "grey30",
+        margin = margin(b = 10)
+      ),
+      plot.caption = element_text(
+        size = 9,
+        colour = "grey40",
+        hjust = 0
+      ),
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(colour = "grey20"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(
+        colour = "grey88",
+        linewidth = 0.4
+      ),
+      plot.background = element_rect(
+        fill = "white",
+        colour = NA
+      ),
+      panel.background = element_rect(
+        fill = "white",
+        colour = NA
+      ),
+      plot.margin = margin(15, 20, 15, 15)
+    )
+}
+
+# Consistent color palette
+col_blue   <- "#2C7FB8"
+col_green  <- "#1B9E77"
+col_orange <- "#E67E22"
+col_purple <- "#5E3C99"
+col_gray   <- "#4D4D4D"
+```
+
+```{r}
+# 8a. Histogram: Raw homicide rate
+p1 <- ggplot(panel_clean, aes(x = homicide_rate)) +
+  geom_histogram(
+    bins = 35,
+    fill = alpha(col_blue, 0.85),
+    colour = "white",
+    linewidth = 0.25
+  ) +
+  geom_vline(
+    xintercept = median(panel_clean$homicide_rate, na.rm = TRUE),
+    linetype = "dashed",
+    linewidth = 0.8,
+    colour = col_gray
+  ) +
+  annotate(
+    "text",
+    x = median(panel_clean$homicide_rate, na.rm = TRUE),
+    y = Inf,
+    label = "Median",
+    vjust = 1.5,
+    hjust = -0.1,
+    size = 3.3,
+    colour = col_gray
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Distribution of Homicide Rates",
+    subtitle = "Raw intentional homicides per 100,000 population",
+    x = "Homicide rate",
+    y = "Number of observations"
+  ) +
+  theme_pub()
+
+ggsave(
+  "fig1a_homicide_raw.png",
+  p1,
+  width = 7.5,
+  height = 4.5,
+  dpi = 400,
+  bg = "white"
+)
+print(p1)
+```
+
+
+```{r}
+# 8b. Histogram: Log homicide rate
+p2 <- ggplot(panel_clean, aes(x = log_homicide)) +
+  geom_histogram(
+    bins = 40,
+    fill = alpha(col_green, 0.9),
+    colour = "white",
+    linewidth = 0.25
+  ) +
+  geom_density(
+    aes(y = after_stat(count)),
+    linewidth = 1,
+    colour = "#0B6E4F",
+    alpha = 0.2
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Distribution of Log Homicide Rates",
+    subtitle = "Log transformation reduces right-skewness",
+    x = "Log homicide rate",
+    y = "Number of observations"
+  ) +
+  theme_pub()
+
+ggsave(
+  "fig1b_homicide_log.png",
+  p2,
+  width = 7.5,
+  height = 4.5,
+  dpi = 400,
+  bg = "white"
+)
+print(p2)
+```
+
+
+```{r}
+# 8c. Histogram: Gini coefficient
+p3 <- ggplot(panel_clean, aes(x = gini_interp)) +
+  geom_histogram(
+    bins = 30,
+    fill = alpha(col_orange, 0.9),
+    colour = "white",
+    linewidth = 0.25
+  ) +
+  geom_vline(
+    xintercept = mean(panel_clean$gini_interp, na.rm = TRUE),
+    linetype = "dashed",
+    linewidth = 0.8,
+    colour = col_gray
+  ) +
+  annotate(
+    "text",
+    x = mean(panel_clean$gini_interp, na.rm = TRUE),
+    y = Inf,
+    label = "Mean",
+    vjust = 1.5,
+    hjust = -0.1,
+    size = 3.3,
+    colour = col_gray
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Distribution of Income Inequality",
+    subtitle = "Gini coefficient (0–100 scale)",
+    x = "Gini coefficient",
+    y = "Number of observations"
+  ) +
+  theme_pub()
+
+ggsave(
+  "fig2_gini_dist.png",
+  p3,
+  width = 7.5,
+  height = 4.5,
+  dpi = 400,
+  bg = "white"
+)
+print(p3)
+```
+
+
+```{r}
+# 8d. Scatter: Gini vs log homicide
+p4 <- ggplot(panel_clean, aes(x = gini_interp, y = log_homicide)) +
+  geom_point(
+    alpha = 0.18,
+    size = 1.3,
+    colour = col_purple
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    linewidth = 1.2,
+    colour = "#3B1E70",
+    fill = alpha(col_purple, 0.15)
+  ) +
+  labs(
+    title = "Income Inequality and Homicide",
+    subtitle = "Cross-country association across all country-year observations",
+    x = "Gini coefficient",
+    y = "Log homicide rate"
+  ) +
+  theme_pub()
+
+ggsave(
+  "fig3_gini_homicide_scatter.png",
+  p4,
+  width = 7.5,
+  height = 5.5,
+  dpi = 400,
+  bg = "white"
+)
+print(p4)
+```
+
+
+```{r}
+# 8e. Panel coverage by year
+coverage <- panel_clean %>%
+  count(year, name = "n_countries")
+
+p5 <- ggplot(coverage, aes(x = year, y = n_countries)) +
+  geom_col(
+    fill = alpha(col_blue, 0.9),
+    width = 0.75
+  ) +
+  geom_text(
+    aes(label = n_countries),
+    vjust = -0.35,
+    size = 3.4,
+    fontface = "bold",
+    colour = "grey20"
+  ) +
+  scale_x_continuous(breaks = coverage$year) +
+  expand_limits(y = max(coverage$n_countries) * 1.08) +
+  labs(
+    title = "Panel Coverage Over Time",
+    subtitle = "Number of countries with complete data each year",
+    x = "Year",
+    y = "Countries"
+  ) +
+  theme_pub() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+ggsave(
+  "fig4_panel_coverage.png",
+  p5,
+  width = 8,
+  height = 4.8,
+  dpi = 400,
+  bg = "white"
+)
+print(p5)
+```
+
+
+```{r}
+# 9. PANEL REGRESSION MODELS
+
+# Convert to pdata.frame for plm (panel data)
+pdata <- pdata.frame(panel_clean, index = c("iso3", "year"))
+
+
+# ---- Model 1: Pooled OLS (baseline) ----
+# No fixed effects — benchmark model, likely biased due to omitted country traits
+m1 <- plm(
+  log_homicide ~ gini_interp + log_gdppc + democracy,
+  data   = pdata,
+  model  = "pooling"
+)
+
+
+# ---- Model 2: Country Fixed Effects ----
+# Controls for all time-invariant country characteristics (culture, geography, etc.)
+m2 <- plm(
+  log_homicide ~ gini_interp + log_gdppc + democracy,
+  data   = pdata,
+  model  = "within",
+  effect = "individual"   # country FE only
+)
+
+
+# ---- Model 3: Two-Way Fixed Effects (country + year) ----
+# Also controls for global shocks affecting all countries in a given year
+# (e.g. 2008 financial crisis, COVID-19 in 2020)
+m3 <- plm(
+  log_homicide ~ gini_interp + log_gdppc + democracy,
+  data   = pdata,
+  model  = "within",
+  effect = "twoways"   # country + year FE
+)
+
+
+# ---- Model 4: Two-Way FE + Interaction (secondary hypothesis) ----
+# Tests H2: does democracy moderate the inequality-crime relationship?
+m4 <- plm(
+  log_homicide ~ gini_interp + log_gdppc + democracy + gini_x_dem,
+  data   = pdata,
+  model  = "within",
+  effect = "twoways"
+)
+
+
+# ---- Hausman Test: FE vs RE ----
+# H0: random effects are consistent (use RE)
+# If p < 0.05: reject H0, fixed effects preferred
+m2_re <- plm(
+  log_homicide ~ gini_interp + log_gdppc + democracy,
+  data   = pdata,
+  model  = "random"
+)
+
+hausman_test <- phtest(m2, m2_re)
+cat("\n=== HAUSMAN TEST ===\n")
+print(hausman_test)
+```
+
+
+```{r}
+# 10. CLUSTERED STANDARD ERRORS
+
+# We cluster SEs at the country level to account for serial correlation
+# within countries over time (Bertrand, Duflo, Mullainathan, 2004)
+
+cluster_se <- function(model, data = pdata) {
+  coeftest(model, vcov = vcovHC(model, type = "HC1", cluster = "group"))
+}
+
+m1_se <- cluster_se(m1)
+m2_se <- cluster_se(m2)
+m3_se <- cluster_se(m3)
+m4_se <- cluster_se(m4)
+
+# Print main model results
+cat("\n=== MODEL 3: Two-Way FE (Main Model) ===\n")
+print(m3_se)
+
+cat("\n=== MODEL 4: Two-Way FE + Interaction ===\n")
+print(m4_se)
+```
+
+
+```{r}
+# 11. PUBLICATION-QUALITY REGRESSION TABLE
+
+# Cluster-robust variance-covariance matrices
+vcov_list <- list(
+  vcovHC(m1, method = "arellano", type = "HC1", cluster = "group"),
+  vcovHC(m2, method = "arellano", type = "HC1", cluster = "group"),
+  vcovHC(m3, method = "arellano", type = "HC1", cluster = "group"),
+  vcovHC(m4, method = "arellano", type = "HC1", cluster = "group")
+)
+
+# Model labels
+model_list <- list(
+  "Pooled OLS"               = m1,
+  "Country FE"               = m2,
+  "Two-Way FE"               = m3,
+  "FE + Interaction"         = m4
+)
+
+# Create a beautifully formatted GT table
+reg_table <- modelsummary(
+  models = model_list,
+  vcov = vcov_list,
+
+  # significance stars
+  stars = c("*" = 0.10, "**" = 0.05, "***" = 0.01),
+
+  # rename coefficients
+  coef_rename = c(
+    "gini_interp" = "Gini coefficient",
+    "log_gdppc"   = "Log GDP per capita",
+    "democracy"   = "Democracy index",
+    "gini_x_dem"  = "Gini × Democracy"
+  ),
+
+  # cleaner goodness-of-fit section
+  gof_map = tribble(
+    ~raw,         ~clean,         ~fmt,
+    "nobs",       "Observations", 0,
+    "r.squared",  "R²",           3,
+    "adj.r.squared", "Adjusted R²", 3
+  ),
+
+  gof_omit = "AIC|BIC|Log|F$|RMSE",
+
+  # display estimate with stars and SE in parentheses
+  estimate  = "{estimate}{stars}",
+  statistic = "({std.error})",
+
+  # use GT for modern styling
+  output = "gt"
+)
+
+
+# Style the table (ASCII-safe text only)
+reg_table_styled <- reg_table %>%
+  gt::tab_header(
+    title = gt::md("**Table 2. Income Inequality and Homicide Rates**"),
+    subtitle = gt::md("Panel Regression Results, 2006-2023")
+  ) %>%
+  gt::tab_source_note(
+    source_note = gt::md(
+      "Cluster-robust standard errors (country level) in parentheses.<br>
+      *** p < 0.01, ** p < 0.05, * p < 0.10.<br>
+      Dependent variable: Log homicide rate per 100,000 population."
+    )
+  ) %>%
+  gt::opt_row_striping() %>%
+  gt::tab_options(
+    table.font.names = c("Times New Roman", "Georgia", "serif"),
+    table.font.size = gt::px(13),
+    heading.title.font.size = gt::px(18),
+    heading.subtitle.font.size = gt::px(12),
+    source_notes.font.size = gt::px(10),
+    data_row.padding = gt::px(5)
+  )
+
+# Display in RStudio Viewer
+print(reg_table_styled)
+
+# Save to HTML
+gt::gtsave(
+  reg_table_styled,
+  filename = "regression_table.html"
+)
+
+# Also save as Word using modelsummary directly
+modelsummary(
+  models = model_list,
+  vcov = vcov_list,
+  stars = c("*" = 0.10, "**" = 0.05, "***" = 0.01),
+  coef_rename = c(
+    "gini_interp" = "Gini coefficient",
+    "log_gdppc"   = "Log GDP per capita",
+    "democracy"   = "Democracy index",
+    "gini_x_dem"  = "Gini x Democracy"
+  ),
+  estimate  = "{estimate}{stars}",
+  statistic = "({std.error})",
+  gof_omit  = "AIC|BIC|Log|F$|RMSE",
+  title = "Table 2. Income Inequality and Homicide Rates",
+  notes = c(
+    "Cluster-robust standard errors (country level) in parentheses.",
+    "*** p < 0.01, ** p < 0.05, * p < 0.10.",
+    "Dependent variable: Log homicide rate per 100,000 population."
+  ),
+  output = "regression_table.docx"
+)
+
+cat("Files saved:\n")
+cat("- regression_table.html\n")
+cat("- regression_table.docx\n")
+```
+
+
+```{r}
+# 12. ROBUSTNESS CHECKS
+
+# ---- 12a. Alternative dependent variable: regional homicide estimates ----
+# Use UNODC's regional estimates sheet as an alternative measure
+hom_reg_raw <- read_excel(
+  path  = paste0(data_path, "homicide_data.xlsx"),
+  sheet = "data_cts_homicide_reg_estimates",
+  skip  = 2
+)
+
+# ---- 12b. Exclude outlier countries with extremely high homicide rates ----
+# Countries with homicide rate > 60 per 100,000 (e.g. El Salvador in peak years)
+# may unduly influence results
+
+panel_no_outliers <- panel_clean %>%
+  filter(homicide_rate <= 60)
+
+pdata_robust <- pdata.frame(panel_no_outliers, index = c("iso3", "year"))
+
+m3_robust <- plm(
+  log_homicide ~ gini_interp + log_gdppc + democracy,
+  data   = pdata_robust,
+  model  = "within",
+  effect = "twoways"
+)
+
+cat("\n=== ROBUSTNESS: Two-Way FE excluding extreme outliers ===\n")
+print(coeftest(m3_robust, vcov = vcovHC(m3_robust, type = "HC1", cluster = "group")))
+
+```
+
+
+```{r}
+# 13. SAVE CLEAN DATASET
+
+write_csv(panel_clean, "panel_clean.csv")
+cat("\nClean panel saved to panel_clean.csv\n")
+cat("Ready for regression. Final sample:", nrow(panel_clean),
+    "obs,", n_distinct(panel_clean$iso3), "countries, 2006-2023\n")
+
+```
